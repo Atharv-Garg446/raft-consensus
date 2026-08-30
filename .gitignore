@@ -1,0 +1,28 @@
+# Rust generated files
+target/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Cargo lock file (uncomment if this is a library)
+# Cargo.lock
+
+# Environment variables
+.env
+
+# Backup files
+*.bak
+*.orig
