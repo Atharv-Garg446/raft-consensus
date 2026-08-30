@@ -221,5 +221,4 @@ Implementation notes
 - Timers are tuned for local testing — increase timeouts for real networks.
 - `append_entries` supports basic conflict detection; followers may return `conflict_index` and `conflict_term` to help the leader repair logs.
 
-If you'd like, I can also add a small Postman collection or sample Rust client to exercise these endpoints.
 
