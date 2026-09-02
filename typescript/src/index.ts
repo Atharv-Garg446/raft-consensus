@@ -2,18 +2,21 @@ import express from "express";
 import { randomInt } from "crypto";
 import axios from "axios";
 import { program } from "commander";
+import {
+  LogEntry,
+  lastLogIndex,
+  lastLogTerm,
+  getLogTerm,
+  isLogUpToDate,
+  majority as computeMajority,
+  applyAppendEntries,
+  computeCommitIndex,
+} from "./raft-logic";
 
 enum Role {
   Follower = "Follower",
   Candidate = "Candidate",
   Leader = "Leader",
-}
-
-interface LogEntry {
-  term: number;
-  index: number;
-  key: number;
-  value: string;
 }
 
 interface RequestVoteArgs {
@@ -83,23 +86,25 @@ class RaftState {
     this.peers = peers;
   }
 
+  // These all delegate to raft-logic.ts, which is the part of this codebase
+  // that's actually unit tested (see raft-logic.test.ts). Keeping the
+  // election-safety and log-matching rules there, separate from the
+  // Express/HTTP/timer plumbing in this class, is what makes it possible to
+  // test them without starting a server or a multi-node cluster.
   lastLogIndex(): number {
-    const last = this.log[this.log.length - 1];
-    return last ? last.index : 0;
+    return lastLogIndex(this.log);
   }
 
-  lastLogTerm(): number { 
-    const last = this.log[this.log.length - 1];
-    return last ? last.term : 0;
+  lastLogTerm(): number {
+    return lastLogTerm(this.log);
   }
 
-  getLogTerm(index: number): number | undefined {  
-    if (index === 0) return 0;
-    return this.log.find((e) => e.index === index)?.term;
+  getLogTerm(index: number): number | undefined {
+    return getLogTerm(this.log, index);
   }
 
-  majority(): number { 
-    return Math.floor((this.peers.length + 2) / 2);
+  majority(): number {
+    return computeMajority(this.peers.length + 1); // peers + self
   }
 }
 
@@ -151,10 +156,12 @@ class RaftNode {
       this.state.role = Role.Follower;
     }
 
-    const upToDate =
-      args.lastLogTerm > this.state.lastLogTerm() ||
-      (args.lastLogTerm === this.state.lastLogTerm() &&
-        args.lastLogIndex >= this.state.lastLogIndex());
+    const upToDate = isLogUpToDate(
+      args.lastLogTerm,
+      args.lastLogIndex,
+      this.state.lastLogTerm(),
+      this.state.lastLogIndex()
+    );
 
     let voteGranted = false;
     if (
@@ -192,36 +199,22 @@ class RaftNode {
 
     this.state.lastHeartbeatMs = Date.now();
 
-    if (args.prevLogIndex > 0) { 
-      const prevEntry = this.state.log.find(
-        (e) => e.index === args.prevLogIndex
-      );
-      if (!prevEntry || prevEntry.term !== args.prevLogTerm) {
-        res.json({
-          term: this.state.currentTerm,
-          success: false,
-          conflictIndex: prevEntry
-            ? prevEntry.index
-            : this.state.lastLogIndex() + 1,
-          conflictTerm: prevEntry?.term,
-        });
-        return;
-      }
-    }
+    const result = applyAppendEntries(
+      this.state.log,
+      args.prevLogIndex,
+      args.prevLogTerm,
+      args.entries
+    );
+    this.state.log = result.log;
 
-    for (const entry of args.entries) {
-      const existingIndex = this.state.log.findIndex(
-        (e) => e.index === entry.index
-      );
-      if (existingIndex >= 0) {
-        const existingEntry = this.state.log[existingIndex];
-        if (existingEntry && existingEntry.term !== entry.term) {
-          this.state.log.splice(existingIndex);
-          this.state.log.push(entry);
-        }
-      } else {
-        this.state.log.push(entry);
-      }
+    if (!result.success) {
+      res.json({
+        term: this.state.currentTerm,
+        success: false,
+        conflictIndex: result.conflictIndex,
+        conflictTerm: result.conflictTerm,
+      });
+      return;
     }
 
     this.state.commitIndex = Math.min(
@@ -443,19 +436,19 @@ class RaftNode {
   private updateCommitIndex(): void {
     if (this.state.role !== Role.Leader) return;
 
-    const indices = [
-      ...this.state.matchIndex.values(),
+    const newCommitIndex = computeCommitIndex(
+      [...this.state.matchIndex.values()],
       this.state.lastLogIndex(),
-    ];
-    indices.sort((a, b) => b - a);
-    const n = indices[Math.floor((indices.length - 1) / 2)];
+      this.state.currentTerm,
+      this.state.log,
+      this.state.commitIndex
+    );
 
-    if (n !== undefined && n > this.state.commitIndex) {
-      const entry = this.state.log.find((e) => e.index === n);
-      if (entry && entry.term === this.state.currentTerm) {
-        this.state.commitIndex = n;
-        console.log(`Leader ${this.state.id} advanced commit_index to ${n}`);
-      }
+    if (newCommitIndex > this.state.commitIndex) {
+      this.state.commitIndex = newCommitIndex;
+      console.log(
+        `Leader ${this.state.id} advanced commit_index to ${newCommitIndex}`
+      );
     }
   }
 

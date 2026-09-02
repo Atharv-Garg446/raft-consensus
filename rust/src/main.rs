@@ -16,6 +16,9 @@ use tracing::{info, debug};
 
 use dotenvy::dotenv;
 
+mod raft_logic;
+use raft_logic::LogEntry;
+
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -28,14 +31,6 @@ struct Args {
     /// comma separated peer entries: id:host:port (e.g., "2:127.0.0.1:7002,3:127.0.0.1:7003")
     #[arg(long, default_value_t = String::new())]
     peers: String,
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug)]
-struct LogEntry {
-    term: u64,
-    index: i64,
-    key: i64,
-    value: String,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -156,25 +151,26 @@ impl RaftState {
         }
     }
 
+    // These all delegate to raft_logic, which is the part of this codebase
+    // that's actually unit tested (see rust/src/raft_logic.rs). Keeping the
+    // election-safety and log-matching rules there, separate from the
+    // Mutex/MongoDB/HTTP plumbing in this file, is what makes it possible to
+    // test them without spinning up a cluster.
     fn last_log_index(&self) -> i64 {
-        self.log.last().map(|e| e.index).unwrap_or(0)
+        raft_logic::last_log_index(&self.log)
     }
 
     fn last_log_term(&self) -> u64 {
-        self.log.last().map(|e| e.term).unwrap_or(0)
+        raft_logic::last_log_term(&self.log)
     }
 
     fn get_log_term(&self, index: i64) -> Option<u64> {
-        if index == 0 {
-            return Some(0);
-        }
-        self.log.iter().find(|e| e.index == index).map(|e| e.term)
+        raft_logic::get_log_term(&self.log, index)
     }
 
     fn majority(&self) -> usize {
-        // Majority (quorum) = floor(total_nodes/2) + 1
         let total_nodes = self.peers.len() + 1; // peers + self
-        (total_nodes / 2) + 1
+        raft_logic::majority(total_nodes)
     }
 
     // Helper function to get value from MongoDB
@@ -308,8 +304,12 @@ async fn request_vote_handler(
         s.role = Role::Follower;
     }
     
-    let up_to_date = (args.last_log_term > s.last_log_term())
-        || (args.last_log_term == s.last_log_term() && args.last_log_index >= s.last_log_index());
+    let up_to_date = raft_logic::is_log_up_to_date(
+        args.last_log_term,
+        args.last_log_index,
+        s.last_log_term(),
+        s.last_log_index(),
+    );
     
     let vote_granted = if (s.voted_for.is_none() || s.voted_for == Some(args.candidate_id))
         && up_to_date
@@ -357,55 +357,27 @@ async fn append_entries_handler(
     
     s.last_heartbeat_ms = current_ms();
 
-    if args.prev_log_index > 0 {
-        match s.log.iter().find(|e| e.index == args.prev_log_index) {
-            Some(e) => {
-                if e.term != args.prev_log_term {
-                    let conflict_term = e.term;
-                    let conflict_index = s
-                        .log
-                        .iter()
-                        .find(|x| x.term == conflict_term)
-                        .map(|x| x.index)
-                        .unwrap_or(1);
-                    
-                    debug!("Node {} conflict at index {} term mismatch", s.id, args.prev_log_index);
-                    
-                    return (
-                        StatusCode::OK,
-                        Json(AppendEntriesResponse {
-                            term: s.current_term,
-                            success: false,
-                            conflict_index: Some(conflict_index),
-                            conflict_term: Some(conflict_term),
-                        }),
-                    );
-                }
-            }
-            None => {
-                debug!("Node {} missing entry at index {}", s.id, args.prev_log_index);
-                return (
-                    StatusCode::OK,
-                    Json(AppendEntriesResponse {
-                        term: s.current_term,
-                        success: false,
-                        conflict_index: Some(s.last_log_index() + 1),
-                        conflict_term: None,
-                    }),
-                );
-            }
-        }
-    }
+    let result = raft_logic::apply_append_entries(
+        &mut s.log,
+        args.prev_log_index,
+        args.prev_log_term,
+        &args.entries,
+    );
 
-    for entry in args.entries.iter() {
-        if let Some(pos) = s.log.iter().position(|e| e.index == entry.index) {
-            if s.log[pos].term != entry.term {
-                s.log.truncate(pos);
-                s.log.push(entry.clone());
-            }
-        } else {
-            s.log.push(entry.clone());
-        }
+    if !result.success {
+        debug!(
+            "Node {} rejected AppendEntries from leader {} (conflict_index={:?})",
+            s.id, args.leader_id, result.conflict_index
+        );
+        return (
+            StatusCode::OK,
+            Json(AppendEntriesResponse {
+                term: s.current_term,
+                success: false,
+                conflict_index: result.conflict_index,
+                conflict_term: result.conflict_term,
+            }),
+        );
     }
 
     if args.leader_commit > s.commit_index {
@@ -758,21 +730,19 @@ fn update_commit_index(s: &mut RaftState) {
     if s.role != Role::Leader {
         return;
     }
-    
-    let mut indices: Vec<i64> = s.match_index.values().copied().collect();
-    indices.push(s.last_log_index());
-    indices.sort_by(|a, b| b.cmp(a));
-    
-    let majority_idx = (indices.len() - 1) / 2;
-    let n = indices[majority_idx];
-    
-    if n > s.commit_index {
-        if let Some(entry) = s.log.iter().find(|e| e.index == n) {
-            if entry.term == s.current_term {
-                s.commit_index = n;
-                debug!("Leader {} advanced commit_index to {}", s.id, n);
-            }
-        }
+
+    let match_indices: Vec<i64> = s.match_index.values().copied().collect();
+    let new_commit_index = raft_logic::compute_commit_index(
+        match_indices,
+        s.last_log_index(),
+        s.current_term,
+        &s.log,
+        s.commit_index,
+    );
+
+    if new_commit_index > s.commit_index {
+        s.commit_index = new_commit_index;
+        debug!("Leader {} advanced commit_index to {}", s.id, new_commit_index);
     }
 }
 

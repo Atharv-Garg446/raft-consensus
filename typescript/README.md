@@ -1,14 +1,14 @@
-# Raft Consensus — TypeScript Implementation
+# Raft Consensus — TypeScript implementation
 
-A complete in-memory implementation of the **Raft Distributed Consensus Algorithm** in TypeScript using **Node.js**, **Express**, and **Axios**.
+An in-memory Raft node built with Node.js, Express, and Axios. Implements the same protocol as the Rust version in this repo — see the root README for how the two compare and why both exist.
 
 ## Features
 
-- **Leader Election**: Randomized election timers, candidate step-up, vote requests, split-vote handling.
-- **Log Replication**: Heartbeats, log entry replication, majority consensus commit, log consistency checks and conflict resolution.
-- **State Machine**: In-memory key-value store committed on quorum.
-- **Client Interface**: Direct client requests (`/client/set`, `/client/get/:key`) with leader forwarding/redirection.
-- **Diagnostics**: Real-time status endpoint (`/status`) showing role, term, logs, commit index, and state store.
+- **Leader election** — randomized election timers, candidate step-up, majority-vote counting, split-vote handling.
+- **Log replication** — heartbeats, entry replication, log-matching and conflict resolution when a follower's log has diverged from the leader's.
+- **State machine** — an in-memory key-value store, updated only once an entry is committed by a majority.
+- **Client interface** — `/client/set` and `/client/get/:key`, with non-leaders replying `not_leader` so a client can find the current leader.
+- **Diagnostics** — `/status` for role, term, log state, and the current key-value store contents.
 
 ## Installation
 
@@ -17,32 +17,32 @@ cd typescript
 npm install
 ```
 
-## Running Locally
-
-### Option 1: Multi-node cluster using NPM scripts
+## Running tests
 
 ```bash
-# Run a 3-node cluster concurrently
-npm run test:3node
-
-# Or run a 5-node cluster concurrently
-npm run test:5node
+npm test
 ```
 
-### Option 2: Individual nodes
+This runs the unit tests in `src/raft-logic.test.ts` against the pure logic in `src/raft-logic.ts` — the election-restriction check, log conflict resolution, and the commit-index safety rule. No server or cluster needed; they run in well under a second.
+
+## Running a cluster locally
+
+### Option 1: npm scripts (spins up several nodes at once)
 
 ```bash
-# Node 1
+npm run test:3node   # 3-node cluster
+npm run test:5node   # 5-node cluster
+```
+
+### Option 2: one node at a time
+
+```bash
 npm run node1
-
-# Node 2
 npm run node2
-
-# Node 3
 npm run node3
 ```
 
-### Option 3: Using helper shell scripts
+### Option 3: shell scripts
 
 ```bash
 ./scripts/start-node1.sh
@@ -50,99 +50,77 @@ npm run node3
 ./scripts/start-node3.sh
 ```
 
-### Option 4: Custom CLI configuration
+### Option 4: custom CLI args
 
 ```bash
 npm run dev -- --id 1 --port 7001 --peers "2:127.0.0.1:7002,3:127.0.0.1:7003"
 ```
 
-## API Endpoints
+Once a cluster is running, watch the console output: nodes start as `Follower`, one times out and becomes `Candidate`, then wins the election and becomes `Leader`. Kill the leader's process (Ctrl+C in its terminal) and watch the remaining nodes elect a new one within a few hundred milliseconds.
 
-### 1. Raft RPCs (Internal)
+## API endpoints
 
-#### Request Vote
-- **POST** `/raft/request_vote`
-- **Body**:
-  ```json
-  {
-    "term": 1,
-    "candidateId": 1,
-    "lastLogIndex": 0,
-    "lastLogTerm": 0
-  }
-  ```
-- **Response**:
-  ```json
-  {
-    "term": 1,
-    "voteGranted": true
-  }
-  ```
+### Raft RPCs (internal)
 
-#### Append Entries / Heartbeat
-- **POST** `/raft/append_entries`
-- **Body**:
-  ```json
-  {
-    "term": 1,
-    "leaderId": 1,
-    "prevLogIndex": 0,
-    "prevLogTerm": 0,
-    "entries": [
-      { "term": 1, "index": 1, "key": 100, "value": "demo" }
-    ],
-    "leaderCommit": 0
-  }
-  ```
-- **Response**:
-  ```json
-  {
-    "term": 1,
-    "success": true
-  }
-  ```
+**`POST /raft/request_vote`**
+```json
+{ "term": 1, "candidateId": 1, "lastLogIndex": 0, "lastLogTerm": 0 }
+```
+→
+```json
+{ "term": 1, "voteGranted": true }
+```
 
-### 2. Client Operations
+**`POST /raft/append_entries`**
+```json
+{
+  "term": 1,
+  "leaderId": 1,
+  "prevLogIndex": 0,
+  "prevLogTerm": 0,
+  "entries": [{ "term": 1, "index": 1, "key": 100, "value": "demo" }],
+  "leaderCommit": 0
+}
+```
+→
+```json
+{ "term": 1, "success": true }
+```
 
-#### Set Key-Value
-- **POST** `/client/set`
-- **Body**:
-  ```json
-  {
-    "key": 42,
-    "value": "hello world"
-  }
-  ```
-- **Response**:
-  ```json
-  {
-    "status": "committed",
-    "index": 1
-  }
-  ```
+### Client operations
 
-#### Get Value by Key
-- **GET** `/client/get/:key`
-- **Response**:
-  ```json
-  {
-    "found": true,
-    "value": "hello world"
-  }
-  ```
+**`POST /client/set`**
+```json
+{ "key": 42, "value": "hello world" }
+```
+→
+```json
+{ "status": "committed", "index": 1 }
+```
+(or `{ "status": "not_leader" }` if sent to a non-leader node)
 
-#### Cluster Status
-- **GET** `/status`
-- **Response**:
-  ```json
-  {
-    "id": 1,
-    "role": "Leader",
-    "term": 1,
-    "lastLogIndex": 1,
-    "lastLogTerm": 1,
-    "commitIndex": 1,
-    "lastApplied": 1,
-    "store": { "42": "hello world" }
-  }
-  ```
+**`GET /client/get/:key`**
+→
+```json
+{ "found": true, "value": "hello world" }
+```
+
+**`GET /status`**
+→
+```json
+{
+  "id": 1,
+  "role": "Leader",
+  "term": 1,
+  "lastLogIndex": 1,
+  "lastLogTerm": 1,
+  "commitIndex": 1,
+  "lastApplied": 1,
+  "store": { "42": "hello world" }
+}
+```
+
+## Notes on this implementation
+
+- State (log, term, role, key-value store) lives entirely in memory — restarting a node loses everything. A production implementation would need to persist the log and `votedFor` to disk before responding to RPCs, which is a safety requirement of the algorithm itself, not an optimization. See the root README for more on this tradeoff.
+- Election and heartbeat timers are tuned for fast local testing (150–300ms election timeout, 50ms heartbeat interval); a deployment across a real network would need larger values.

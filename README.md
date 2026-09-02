@@ -1,111 +1,104 @@
 # Raft Consensus Algorithm
 
-A multi-language repository containing implementations of the **Raft Distributed Consensus Algorithm** in **Rust** and **TypeScript**.
+Two implementations of the Raft distributed consensus algorithm — one in Rust, one in TypeScript — built to actually understand how Raft works, not just read the paper.
 
-Raft is a consensus algorithm designed to be understandable and fault-tolerant, equivalent to Paxos in fault-tolerance and performance while decomposing consensus into key elements such as leader election, log replication, and safety.
+Raft solves a specific problem: how do you get a cluster of machines to agree on a sequence of operations (like writes to a key-value store) even when some of the machines crash or the network drops messages, without any single machine's failure corrupting the data? It's the algorithm behind systems like etcd (which Kubernetes runs on) and Consul. I picked it because it's one of the few distributed systems algorithms designed from the ground up to be understandable rather than just provably correct — which made it a good target for "build it myself and see if I really get it."
 
----
-
-## 📁 Repository Structure
+## Repository structure
 
 ```text
 .
-├── rust/                      # Rust Raft Implementation
+├── rust/                      # Rust implementation
 │   ├── Cargo.toml
-│   ├── Cargo.lock
-│   ├── README.md
+│   ├── README.md              # HTTP API reference + run instructions
 │   └── src/
-│       └── main.rs
+│       ├── main.rs            # HTTP handlers, background loops, state
+│       └── raft_logic.rs      # Pure algorithm logic + unit tests
 │
-├── typescript/                # TypeScript Raft Implementation
+├── typescript/                # TypeScript implementation
 │   ├── package.json
-│   ├── package-lock.json
-│   ├── tsconfig.json
-│   ├── README.md
-│   ├── scripts/
-│   │   ├── start-node1.sh
-│   │   ├── start-node2.sh
-│   │   └── start-node3.sh
+│   ├── README.md              # HTTP API reference + run instructions
 │   └── src/
-│       ├── index.ts
-│       └── types.ts
+│       ├── index.ts           # Express routes, background loops, state
+│       ├── raft-logic.ts      # Pure algorithm logic
+│       └── raft-logic.test.ts # Unit tests (vitest)
 │
-├── .gitignore
-└── README.md                  # Root documentation
+└── README.md
 ```
 
----
+## Why two implementations
 
-## 🚀 Quick Start
+Partly because I wanted to compare how the same algorithm feels in a language with a garbage collector and single-threaded event loop (TypeScript/Node) versus one with explicit ownership and real concurrency (Rust/Tokio). The core logic ends up nearly identical — same RPCs, same state transitions — but the Rust version needs an `Arc<Mutex<...>>` around shared state because multiple async tasks touch it concurrently, while the TypeScript version gets that for free from Node's single-threaded event loop. Writing both made the parts of Raft that are inherent to the algorithm (vs. incidental to the language) much clearer to me.
 
-### 1. Rust Implementation (`rust/`)
+## Design decisions and tradeoffs
 
-Built with asynchronous Rust using **Tokio**, **Axios/Reqwest/Hyper/Warp/Axum**, and **Serde**.
+**HTTP + JSON instead of a binary RPC framework (gRPC, etc.).** Real Raft implementations (etcd, CockroachDB) use gRPC for performance and strongly-typed schemas. I used plain HTTP/JSON because it's inspectable with `curl` while debugging — I could watch exactly what a `RequestVote` RPC looked like on the wire without a proto compiler in the way. The tradeoff is real overhead (JSON parsing, no streaming) that a production system wouldn't accept.
+
+**In-memory log, no persistence to disk.** A real Raft node has to persist its log and `voted_for` to disk before responding to RPCs, so that a crash-and-restart doesn't forget who it voted for or what it had committed — that's actually required for the algorithm's safety guarantees, not just an implementation detail. I left this out to keep the project scoped to the consensus logic itself (leader election, log replication, commit safety) rather than becoming a storage-engine project. It's the single biggest gap between this and a production-ready implementation, and I'd want to add write-ahead-log persistence as the next step if I extended this.
+
+**Locking the whole state behind one mutex (Rust) / relying on the single-threaded event loop (TypeScript), instead of message-passing actors.** A single lock is simpler to reason about and avoids partial-update bugs, at the cost of serializing all access — every RPC handler and background loop takes the same lock. For a learning project favoring correctness over throughput, that tradeoff made sense.
+
+**Pure logic separated from networking (`raft_logic.rs` / `raft-logic.ts`).** The actual Raft rules — the election-restriction check, log-matching and conflict resolution, and the commit-index safety rule — live in standalone files with no HTTP, no locks, no database calls. `main.rs` / `index.ts` just wire them up to handlers. This is what makes it possible to unit test the parts of Raft that are easy to get subtly wrong (see below) without spinning up a cluster.
+
+## The subtle part of Raft that's easy to get wrong
+
+The one rule in Raft that isn't obvious from a first read of the paper: a leader can only advance its commit index by counting replicas for entries from **its own current term**. If an entry from an older term happens to be on a majority of servers, the leader still can't commit it directly — it has to wait until it's committed something from its current term first. This is Figure 8 in the original paper, and it exists because otherwise a later leader can end up silently overwriting an entry that an earlier leader considered "safely committed." Both `compute_commit_index` (Rust) and `computeCommitIndex` (TypeScript) implement this, and it's directly covered by a test in both suites.
+
+## Quick start
+
+### Rust (`rust/`)
 
 ```bash
 cd rust
-
-# Run Node 1
 cargo run -- --id 1 --port 7001 --peers "2:127.0.0.1:7002,3:127.0.0.1:7003"
-
-# Run Node 2
-cargo run -- --id 2 --port 7002 --peers "1:127.0.0.1:7001,3:127.0.0.1:7003"
-
-# Run Node 3
-cargo run -- --id 3 --port 7003 --peers "1:127.0.0.1:7001,2:127.0.0.1:7002"
 ```
 
-For full details, see the [Rust Implementation README](rust/README.md).
+Run unit tests:
 
----
+```bash
+cd rust
+cargo test
+```
 
-### 2. TypeScript Implementation (`typescript/`)
+See the [Rust README](rust/README.md) for the full HTTP API reference and multi-node startup commands.
 
-Built with **Node.js**, **Express**, **Axios**, and **Commander**.
+### TypeScript (`typescript/`)
 
 ```bash
 cd typescript
 npm install
-
-# Run 3-node cluster concurrently
-npm run test:3node
-
-# Or run nodes individually
-npm run node1
-npm run node2
-npm run node3
+npm run test:3node   # starts a 3-node cluster
 ```
 
-For full details, see the [TypeScript Implementation README](typescript/README.md).
+Run unit tests:
 
----
+```bash
+cd typescript
+npm test
+```
 
-## 📡 Common HTTP API Endpoints
+See the [TypeScript README](typescript/README.md) for the full HTTP API reference.
 
-Both implementations expose compatible HTTP REST endpoints for consensus RPCs and client interaction:
+## Common HTTP API
+
+Both implementations expose the same shape of REST API for the Raft RPCs and client interaction:
 
 | Endpoint | Method | Description |
 | :--- | :--- | :--- |
-| `/raft/request_vote` | `POST` | Internal RPC for candidate election vote requests |
-| `/raft/append_entries` | `POST` | Internal RPC for leader heartbeat and log replication |
-| `/client/set` | `POST` | Client key-value write operation (commits across quorum) |
-| `/client/get/:key` | `GET` | Client key-value read operation from state machine |
-| `/status` | `GET` | Node diagnostics (current role, term, log, state machine) |
+| `/raft/request_vote` | `POST` | Internal RPC: candidate requests a vote during an election |
+| `/raft/append_entries` | `POST` | Internal RPC: leader heartbeat and log replication |
+| `/client/set` | `POST` | Client write; only the leader accepts this, others reply `not_leader` |
+| `/client/get/:key` | `GET` | Client read from the state machine |
+| `/status` | `GET` | Diagnostics: current role, term, log length, commit index, state machine contents |
 
----
+## What's implemented
 
-## 💡 Key Raft Concepts Implemented
+- **Leader election** — randomized election timeouts (150–300ms) to avoid split votes, the `Follower` → `Candidate` → `Leader` state machine, and majority-quorum vote counting.
+- **Log replication** — `AppendEntries` RPCs with conflict detection so a leader can repair a follower whose log has diverged, and quorum-based commit index advancement (with the term-safety rule described above).
+- **State machine** — a simple in-memory key-value store, only updated once an entry is committed.
 
-1. **Leader Election**:
-   - Randomized election timeout intervals (150ms – 300ms) to avoid split votes.
-   - Transition between `Follower`, `Candidate`, and `Leader` roles.
-   - Majority quorum voting verification before stepping up as Leader.
+## What's not implemented (and would be next)
 
-2. **Log Replication & Consistency**:
-   - Leader appends client entries to its log and sends `AppendEntries` RPCs to followers.
-   - Quorum-based commit index advancement.
-   - Log repair and conflict detection for lagging or divergent nodes.
-
-3. **State Machine Execution**:
-   - In-memory key-value store applied strictly upon log entry commitment.
-   - Safe reads and atomic state updates.
+- Persistent storage of the log and voted-for state to disk (see "Design decisions" above).
+- Cluster membership changes (adding/removing nodes without downtime).
+- Log compaction / snapshotting, which real systems need once the log grows large.
