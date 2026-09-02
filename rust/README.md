@@ -119,13 +119,23 @@ Response (wrong node):
 { "status": "not_leader", "index": null }
 ```
 
+Response (key already present):
+```json
+{ "status": "Key already exists", "index": null }
+```
+
+Response (didn't commit within ~1 second):
+```json
+{ "status": "timeout", "index": 11 }
+```
+
 ```bash
 curl -X POST http://127.0.0.1:7001/client/set \
   -H 'Content-Type: application/json' \
   -d '{"key":42,"value":"hello"}'
 ```
 
-The leader appends the entry to its own log, then waits (polling every 50ms, up to 1 second) for it to be replicated to a majority before replying `committed`.
+The leader appends the entry to its own log, then waits (polling every 50ms, up to 1 second) for it to be replicated to a majority before replying `committed`. Note this implementation treats keys as write-once — a `set` on an existing key is rejected rather than overwritten. The TypeScript implementation in this repo does not have this restriction; see the root README's "Where the two implementations actually differ" section.
 
 ### `GET /client/get/:key`
 

@@ -52,16 +52,6 @@ interface ClientSet {
   value: string;
 }
 
-// interface ClientSetResp {
-//   status: string;
-//   index?: number;
-// }
-
-// interface ClientGetResp {
-//   found: boolean;
-//   value?: string;
-// }
-
 interface PeerInfo {
   id: number;
   addr: string;
@@ -491,8 +481,12 @@ if (!options.id || !options.port) {
 const peers: PeerInfo[] = (options.peers || "")
   .split(",")
   .filter(Boolean)
-  .map((peerStr: { split: (arg0: string) => [any, any, any]; }) => {
+  .map((peerStr: string): PeerInfo => {
     const [id, host, port] = peerStr.split(":");
+    if (!id || !host || !port) {
+      console.error(`Invalid --peers entry (expected id:host:port): "${peerStr}"`);
+      process.exit(1);
+    }
     return {
       id: parseInt(id, 10),
       addr: `${host}:${port}`,

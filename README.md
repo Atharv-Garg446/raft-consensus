@@ -87,7 +87,7 @@ Both implementations expose the same shape of REST API for the Raft RPCs and cli
 | :--- | :--- | :--- |
 | `/raft/request_vote` | `POST` | Internal RPC: candidate requests a vote during an election |
 | `/raft/append_entries` | `POST` | Internal RPC: leader heartbeat and log replication |
-| `/client/set` | `POST` | Client write; only the leader accepts this, others reply `not_leader` |
+| `/client/set` | `POST` | Client write; only the leader accepts this, others reply `not_leader`. See "Where the two implementations actually differ" below — response behavior isn't identical between the two. |
 | `/client/get/:key` | `GET` | Client read from the state machine |
 | `/status` | `GET` | Diagnostics: current role, term, log length, commit index, state machine contents |
 
@@ -95,7 +95,16 @@ Both implementations expose the same shape of REST API for the Raft RPCs and cli
 
 - **Leader election** — randomized election timeouts (150–300ms) to avoid split votes, the `Follower` → `Candidate` → `Leader` state machine, and majority-quorum vote counting.
 - **Log replication** — `AppendEntries` RPCs with conflict detection so a leader can repair a follower whose log has diverged, and quorum-based commit index advancement (with the term-safety rule described above).
-- **State machine** — a simple in-memory key-value store, only updated once an entry is committed.
+- **State machine** — a key-value store, updated only once an entry is committed by a majority. The Rust implementation persists this to MongoDB; the TypeScript implementation keeps it in memory only, so it's lost on restart. See "Where the two implementations actually differ" below.
+
+## Where the two implementations actually differ
+
+The consensus logic (election, replication, commit safety) is functionally identical between the two — that's the part covered by the shared, tested `raft_logic` modules. Past that, they're not behaviorally identical:
+
+- **Duplicate keys.** Rust's `/client/set` checks its MongoDB-backed store first and rejects the write (`status: "Key already exists"`) if the key is already present. TypeScript's `/client/set` has no such check and always overwrites.
+- **Persistence.** Rust's state machine survives a restart (it's in MongoDB); TypeScript's doesn't (it's an in-memory `Map`).
+
+Neither behavior is "more correct" — they're just different design choices made independently in each implementation. Worth knowing if you're demoing both side by side, since sending the same `/client/set` request twice will behave differently depending on which one you're talking to.
 
 ## What's not implemented (and would be next)
 

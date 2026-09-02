@@ -399,9 +399,17 @@ async fn client_set_handler(
     State(st): State<SharedState>,
     Json(req): Json<ClientSet>,
 ) -> (StatusCode, Json<ClientSetResp>) {
-    // Check if leader
-    {
-        let s = st.lock().await;
+    // Leader check, existing-key check, and log append all happen under a
+    // single lock acquisition. Previously these were three separate
+    // acquisitions, which left a window where this node could step down to
+    // Follower (e.g. on hearing from a real leader in a higher term)
+    // in between the leader check and the log append — and the old code
+    // would still push the entry into this node's log regardless, which
+    // is a real safety violation: a follower log gaining an entry that
+    // never went through consensus.
+    let index = {
+        let mut s = st.lock().await;
+
         if s.role != Role::Leader {
             return (
                 StatusCode::OK,
@@ -411,12 +419,8 @@ async fn client_set_handler(
                 }),
             );
         }
-    }
 
-
-    {
-        let s = st.lock().await;
-        if let Some(_) = s.get_from_db(req.key).await {
+        if s.get_from_db(req.key).await.is_some() {
             return (
                 StatusCode::OK,
                 Json(ClientSetResp {
@@ -425,21 +429,16 @@ async fn client_set_handler(
                 }),
             );
         }
-    }
 
-    // Append to leader's log
-    let (index, _term) = {
-        let mut s = st.lock().await;
         let idx = s.last_log_index() + 1;
-        let t = s.current_term;
         let entry = LogEntry {
-            term: t,
+            term: s.current_term,
             index: idx,
             key: req.key,
             value: req.value.clone(),
         };
         s.log.push(entry);
-        (idx, t)
+        idx
     };
 
     // Wait for replication and commit

@@ -37,6 +37,8 @@ Thumbs.db
 # Environment variables
 .env
 .env.*
+!.env.example
+
 
 # Backup files
 *.bak
